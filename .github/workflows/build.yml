@@ -1,0 +1,125 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+      - master
+      - 'Feat/**'
+      - 'Fix/**'
+  pull_request:
+    branches:
+      - dev
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (Debug or Release)'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+
+    env:
+      BUILD_ROOT: ${{ github.workspace }}
+      CC: clang-20
+      CXX: clang++-20
+
+    steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 32
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Get CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Update glslang external sources
+        working-directory: ${{ env.BUILD_ROOT }}/3rdparty/glslang
+        run: python update_glslang_sources.py
+
+      - name: Install clang-20 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 clang++-20 lld-20 libc++-20-dev libc++abi-20-dev
+
+      - name: Display toolchain info
+        run: |
+          echo "=== Compiler Versions ==="
+          clang-20 --version
+          clang++-20 --version
+          echo "=== Linker Version ==="
+          ld.lld-20 --version || ld.lld --version || true
+          echo "=== CMake Version ==="
+          cmake --version
+          echo "=== Ninja Version ==="
+          ninja --version
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.BUILD_ROOT }}/build
+            !${{ env.BUILD_ROOT }}/build/CMakeCache.txt
+          key: linux-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            linux-${{ matrix.build_type }}-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}-
+            linux-${{ matrix.build_type }}-
+
+      - name: Configure CMake
+        working-directory: ${{ env.BUILD_ROOT }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=clang-20 \
+            -DCMAKE_CXX_COMPILER=clang++-20 \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DBUILD_TEST=OFF \
+            -DBUILD_BENCHMARK=OFF \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build
+        working-directory: ${{ env.BUILD_ROOT }}/build
+        run: cmake --build . --parallel
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobilegl-linux-${{ matrix.build_type }}
+          path: |
+            ${{ env.BUILD_ROOT }}/build/libMobileGL*.so*
+            ${{ env.BUILD_ROOT }}/build/libMobileGL*.a
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Summary job that requires all builds to pass
+  build-status:
+    name: Build Status
+    runs-on: ubuntu-latest
+    needs: [build-linux]
+    if: always()
+    steps:
+      - name: Check build results
+        run: |
+          if [ "${{ needs.build-linux.result }}" != "success" ]; then
+            echo "Linux build failed or was cancelled"
+            exit 1
+          fi
+          echo "All builds completed successfully!"
